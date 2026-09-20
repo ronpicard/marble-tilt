@@ -891,6 +891,7 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
           sinkPhase = 'none'
         } else {
           state = startState(currentLevel)
+          input.level()
           marbleLift = 0
           marbleLiftVel = 0
           sinkPhase = 'popping'

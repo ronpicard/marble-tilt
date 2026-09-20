@@ -2,6 +2,13 @@
 
 All notable changes to Marble Tilt are documented in this file, following the [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [1.3.0] - 2026-09-20
+
+### Changed
+
+- On desktop the mouse now tilts the board only while its left button is held: the board tilts toward the cursor, and levels when you let go. Before, the board followed the cursor whenever it moved, so it tilted by accident.
+- The arrow keys and WASD now tilt the board in steps and leave it there. A tap adds a quarter of the full tilt, holding a key keeps tilting quickly up to the maximum, the opposite key steps back, and Space levels the board. Before, a key slammed the board to full tilt and it snapped back to flat on release. The board also levels itself when the marble is put back at the start after a fall.
+
 ## [1.2.0] - 2026-09-20
 
 ### Added

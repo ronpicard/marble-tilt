@@ -1,7 +1,14 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { MAX_TILT } from './physics.ts'
-import { FULL_DEVICE_TILT_DEG, keysToTilt, orientationToTilt, pointerToTilt, rotateTilt } from './tilt.ts'
+import {
+  FULL_DEVICE_TILT_DEG,
+  keysToTilt,
+  nudgeTilt,
+  orientationToTilt,
+  pointerToTilt,
+  rotateTilt,
+} from './tilt.ts'
 
 const EPS = 1e-9
 
@@ -169,5 +176,37 @@ describe('rotateTilt', () => {
     const copy = { ...input }
     rotateTilt(input, Math.PI / 4)
     assert.deepEqual(input, copy)
+  })
+})
+
+describe('nudgeTilt', () => {
+  const right = { x: MAX_TILT, y: 0 }
+
+  it('adds a fraction of the push and keeps what was already there', () => {
+    const once = nudgeTilt({ x: 0, y: 0 }, right, 0.25)
+    assert.ok(Math.abs(once.x - MAX_TILT * 0.25) < 1e-12)
+    const twice = nudgeTilt(once, right, 0.25)
+    assert.ok(Math.abs(twice.x - MAX_TILT * 0.5) < 1e-12)
+    assert.equal(twice.y, 0)
+  })
+
+  it('never exceeds MAX_TILT, however many times it is pushed', () => {
+    let tilt = { x: 0, y: 0 }
+    for (let i = 0; i < 20; i++) tilt = nudgeTilt(tilt, { x: MAX_TILT, y: MAX_TILT }, 0.25)
+    assert.ok(Math.hypot(tilt.x, tilt.y) <= MAX_TILT + 1e-12)
+  })
+
+  it('steps back toward level when pushed the opposite way', () => {
+    const tilted = nudgeTilt({ x: 0, y: 0 }, right, 0.5)
+    const back = nudgeTilt(tilted, { x: -MAX_TILT, y: 0 }, 0.25)
+    assert.ok(Math.abs(back.x - MAX_TILT * 0.25) < 1e-12)
+  })
+
+  it('leaves the tilt unchanged for non-finite input and does not mutate it', () => {
+    const tilt = { x: 0.05, y: -0.02 }
+    assert.deepEqual(nudgeTilt(tilt, right, Number.NaN), tilt)
+    assert.deepEqual(nudgeTilt(tilt, { x: Number.POSITIVE_INFINITY, y: 0 }, 0.25), tilt)
+    nudgeTilt(tilt, right, 0.25)
+    assert.deepEqual(tilt, { x: 0.05, y: -0.02 })
   })
 })

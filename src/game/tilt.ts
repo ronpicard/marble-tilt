@@ -22,6 +22,19 @@ export function pointerToTilt(dx: number, dy: number, reach: number): Tilt {
 }
 
 /**
+ * Adds `fraction` of a full-strength push to a tilt that stays where it is left, clamping the
+ * result to MAX_TILT (circularly). `push` is a full-magnitude direction such as `keysToTilt`
+ * returns; pushing the opposite way steps the tilt back toward level and past it. Non-finite input
+ * leaves the tilt unchanged.
+ */
+export function nudgeTilt(tilt: Tilt, push: Tilt, fraction: number): Tilt {
+  if (!Number.isFinite(fraction) || !Number.isFinite(push.x) || !Number.isFinite(push.y)) {
+    return { x: tilt.x, y: tilt.y }
+  }
+  return clampTilt({ x: tilt.x + push.x * fraction, y: tilt.y + push.y * fraction })
+}
+
+/**
  * Maps held keys to a tilt at full MAX_TILT magnitude: a single held direction gives the full
  * magnitude along that axis, and a diagonal is normalised to the same magnitude. `up` tilts -y.
  */

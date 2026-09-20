@@ -1,12 +1,24 @@
 import type { Tilt } from '../game/types.ts'
 import type { Pose } from '../game/tilt.ts'
-import { keysToTilt, orientationToTilt, pointerToTilt, rotateTilt } from '../game/tilt.ts'
+import { keysToTilt, nudgeTilt, orientationToTilt, pointerToTilt, rotateTilt } from '../game/tilt.ts'
 import type { MotionStatus } from './engineApi.ts'
 
 /** Degrees of device-orientation drift from neutral below which motion input is ignored. */
 const MOTION_DEADBAND_DEG = 1.5
 
-/** Fraction of the element's shorter side that a mouse must travel from centre for MAX_TILT. */
+/** Share of the full tilt that one tap of a steering key adds. Four taps reach the maximum. */
+const KEY_TAP_FRACTION = 0.25
+
+/** Seconds a steering key must be held before it starts tilting continuously. */
+const KEY_HOLD_DELAY = 0.2
+
+/** Share of the full tilt a held steering key adds per second once it is tilting continuously. */
+const KEY_HOLD_RATE = 2.5
+
+/** The longest gap between two reads that still counts as holding, so a paused tab does not lurch. */
+const KEY_HOLD_MAX_DT = 0.1
+
+/** Fraction of the element's shorter side that a held mouse must be from centre for MAX_TILT. */
 const MOUSE_REACH_FACTOR = 0.4
 
 /** Pixels of joystick travel from the anchor point that produce MAX_TILT for touch/pen. */
@@ -56,7 +68,10 @@ export interface TiltInput {
   getTarget(): Tilt
   /** True once the player has asked for any non-zero tilt since the last reset(). */
   hasMoved(): boolean
+  /** Forgets that the player has moved and levels the board the keys had tilted, for a fresh run. */
   reset(): void
+  /** Levels the board the keys had tilted, so a marble put back at the start is not rolled straight off again. */
+  level(): void
   enableMotion(): Promise<MotionStatus>
   disableMotion(): void
   recenterMotion(): void
@@ -76,17 +91,26 @@ function currentScreenAngle(): number {
 
 /**
  * Combines keyboard, device-motion and pointer input into a single requested tilt, in priority
- * order: keyboard (while any steering key is held), then device motion (once enabled), then the
- * pointer (mouse hover, or a touch/pen virtual joystick).
+ * order: the keyboard (while the keys have the board tilted), then device motion (once enabled),
+ * then the pointer (a held mouse button, or a touch/pen virtual joystick).
+ *
+ * The keys tilt the board and leave it there, like a hand on a real labyrinth: a tap adds a step, a
+ * held key keeps adding, the opposite key steps back, and Space levels the board. The mouse tilts
+ * the board toward the cursor only while its button is held, and levels it on release. Pressing a
+ * pointer takes over from whatever the keys had set.
  */
 export function createTiltInput(element: HTMLElement, options: TiltInputOptions = {}): TiltInput {
   const { viewAzimuth = 0 } = options
   const keys: KeyState = { left: false, right: false, up: false, down: false }
   let moved = false
 
+  let keyTilt: Tilt = { x: 0, y: 0 }
+  // When the held keys last changed, and when the held tilt was last advanced, in seconds.
+  let keysChangedAt = 0
+  let keysAdvancedAt = 0
+
   let mouseTilt: Tilt = { x: 0, y: 0 }
-  // False until the first real pointermove, so a level never starts pre-tilted by a resting cursor.
-  let mouseReady = false
+  let activeMousePointerId: number | null = null
 
   let touchTilt: Tilt = { x: 0, y: 0 }
   let touchAnchor: { x: number; y: number } | null = null
@@ -105,13 +129,40 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
     return keys.left || keys.right || keys.up || keys.down
   }
 
+  function now(): number {
+    return performance.now() / 1000
+  }
+
+  /** Keeps tilting while steering keys stay held past KEY_HOLD_DELAY. */
+  function advanceKeys(): void {
+    if (!anyKeyHeld()) return
+    const t = now()
+    const holdStart = keysChangedAt + KEY_HOLD_DELAY
+    const dt = Math.min(t - Math.max(keysAdvancedAt, holdStart), KEY_HOLD_MAX_DT)
+    keysAdvancedAt = t
+    if (dt <= 0) return
+    keyTilt = nudgeTilt(keyTilt, keysToTilt(keys), KEY_HOLD_RATE * dt)
+  }
+
   function handleKeyDown(event: KeyboardEvent): void {
     if (isFormTarget(event.target)) return
+    if (event.key === ' ') {
+      event.preventDefault()
+      keyTilt = { x: 0, y: 0 }
+      return
+    }
     const direction = KEY_DIRECTIONS[event.key]
     if (!direction) return
     if (event.key.startsWith('Arrow')) event.preventDefault()
+    // The browser repeats keydown while a key is held; the hold is timed in advanceKeys instead.
+    if (event.repeat || keys[direction]) return
     keys[direction] = true
-    markMoved(keysToTilt(keys))
+    keysChangedAt = now()
+    keysAdvancedAt = keysChangedAt
+    const tap: KeyState = { left: false, right: false, up: false, down: false }
+    tap[direction] = true
+    keyTilt = nudgeTilt(keyTilt, keysToTilt(tap), KEY_TAP_FRACTION)
+    markMoved(keyTilt)
   }
 
   function handleKeyUp(event: KeyboardEvent): void {
@@ -119,6 +170,12 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
     const direction = KEY_DIRECTIONS[event.key]
     if (!direction) return
     keys[direction] = false
+    keysChangedAt = now()
+  }
+
+  /** Releases every key, so one held while the window lost focus does not stay stuck down. */
+  function handleBlur(): void {
+    keys.left = keys.right = keys.up = keys.down = false
   }
 
   function mouseReach(): number {
@@ -126,14 +183,18 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
     return MOUSE_REACH_FACTOR * Math.min(rect.width, rect.height)
   }
 
+  /** Tilts toward the cursor: the farther it is from the middle of the element, the steeper. */
+  function aimMouse(event: PointerEvent): void {
+    const rect = element.getBoundingClientRect()
+    const dx = event.clientX - (rect.left + rect.width / 2)
+    const dy = event.clientY - (rect.top + rect.height / 2)
+    mouseTilt = pointerToTilt(dx, dy, mouseReach())
+    markMoved(mouseTilt)
+  }
+
   function handlePointerMove(event: PointerEvent): void {
     if (event.pointerType === 'mouse') {
-      const rect = element.getBoundingClientRect()
-      const dx = event.clientX - (rect.left + rect.width / 2)
-      const dy = event.clientY - (rect.top + rect.height / 2)
-      mouseTilt = pointerToTilt(dx, dy, mouseReach())
-      mouseReady = true
-      markMoved(mouseTilt)
+      if (activeMousePointerId === event.pointerId) aimMouse(event)
       return
     }
     if (activeTouchPointerId !== event.pointerId || !touchAnchor) return
@@ -142,22 +203,31 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
   }
 
   function handlePointerDown(event: PointerEvent): void {
-    if (event.pointerType === 'mouse') return
+    // Whichever pointer is pressed takes over from a tilt the keys left behind.
+    keyTilt = { x: 0, y: 0 }
+    if (event.pointerType === 'mouse') {
+      if (event.button !== 0) return
+      activeMousePointerId = event.pointerId
+      element.setPointerCapture(event.pointerId)
+      aimMouse(event)
+      return
+    }
     touchAnchor = { x: event.clientX, y: event.clientY }
     activeTouchPointerId = event.pointerId
     touchTilt = { x: 0, y: 0 }
     element.setPointerCapture(event.pointerId)
   }
 
-  function endTouch(event: PointerEvent): void {
+  function endPointer(event: PointerEvent): void {
+    if (activeMousePointerId === event.pointerId) {
+      activeMousePointerId = null
+      mouseTilt = { x: 0, y: 0 }
+      return
+    }
     if (activeTouchPointerId !== event.pointerId) return
     touchAnchor = null
     activeTouchPointerId = null
     touchTilt = { x: 0, y: 0 }
-  }
-
-  function handlePointerLeave(event: PointerEvent): void {
-    if (event.pointerType === 'mouse') mouseTilt = { x: 0, y: 0 }
   }
 
   function handleDeviceOrientation(event: DeviceOrientationEvent): void {
@@ -178,20 +248,21 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
   window.addEventListener('keyup', handleKeyUp)
   element.addEventListener('pointermove', handlePointerMove)
   element.addEventListener('pointerdown', handlePointerDown)
-  element.addEventListener('pointerup', endTouch)
-  element.addEventListener('pointercancel', endTouch)
-  element.addEventListener('pointerleave', handlePointerLeave)
+  element.addEventListener('pointerup', endPointer)
+  element.addEventListener('pointercancel', endPointer)
+  window.addEventListener('blur', handleBlur)
 
   return {
     getTarget(): Tilt {
       // Keys steer along the board's own axes, which in an isometric view are the screen diagonals, so they are not rotated.
-      if (anyKeyHeld()) return keysToTilt(keys)
+      advanceKeys()
+      if (anyKeyHeld() || keyTilt.x !== 0 || keyTilt.y !== 0) return keyTilt
       if (motionEnabled) {
         if (!latestPose || !neutralPose) return { x: 0, y: 0 }
         return rotateTilt(orientationToTilt(latestPose, neutralPose, currentScreenAngle()), viewAzimuth)
       }
       if (activeTouchPointerId !== null) return rotateTilt(touchTilt, viewAzimuth)
-      return mouseReady ? rotateTilt(mouseTilt, viewAzimuth) : { x: 0, y: 0 }
+      return activeMousePointerId !== null ? rotateTilt(mouseTilt, viewAzimuth) : { x: 0, y: 0 }
     },
 
     hasMoved(): boolean {
@@ -200,8 +271,11 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
 
     reset(): void {
       moved = false
-      mouseReady = false
-      mouseTilt = { x: 0, y: 0 }
+      keyTilt = { x: 0, y: 0 }
+    },
+
+    level(): void {
+      keyTilt = { x: 0, y: 0 }
     },
 
     async enableMotion(): Promise<MotionStatus> {
@@ -257,9 +331,9 @@ export function createTiltInput(element: HTMLElement, options: TiltInputOptions 
       window.removeEventListener('keyup', handleKeyUp)
       element.removeEventListener('pointermove', handlePointerMove)
       element.removeEventListener('pointerdown', handlePointerDown)
-      element.removeEventListener('pointerup', endTouch)
-      element.removeEventListener('pointercancel', endTouch)
-      element.removeEventListener('pointerleave', handlePointerLeave)
+      element.removeEventListener('pointerup', endPointer)
+      element.removeEventListener('pointercancel', endPointer)
+      window.removeEventListener('blur', handleBlur)
       window.removeEventListener('deviceorientation', handleDeviceOrientation)
     },
   }
