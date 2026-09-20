@@ -3,8 +3,9 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import type { EngineApi, EngineEvents, EngineMode, ViewInsets } from './engineApi.ts'
 import { createTiltInput } from './input.ts'
 import { makeRadialShadowTexture, makeWoodTexture } from './textures.ts'
-import { createAutopilot } from '../game/autopilot.ts'
-import { approachTilt, BALL_RADIUS, FIXED_DT, GOAL_RADIUS, HOLE_RADIUS, startState, step } from '../game/physics.ts'
+import { DEMO_PACE, createAutopilot } from '../game/autopilot.ts'
+import { cellAt, rampAt } from '../game/board.ts'
+import { approachTilt, BALL_RADIUS, FIXED_DT, GOAL_RADIUS, heightAt, HOLE_RADIUS, startState, step } from '../game/physics.ts'
 import type { BallState, Level, Tilt, Vec2 } from '../game/types.ts'
 
 // --- Look ------------------------------------------------------------------------------------
@@ -14,6 +15,9 @@ const FLOOR_BASE_COLOR = '#c99a63'
 const FLOOR_GRAIN_COLOR = '#8a6136'
 const WALL_BASE_COLOR = '#5e4029'
 const WALL_GRAIN_COLOR = '#2b1b10'
+const RAISED_BASE_COLOR = '#a8693a'
+const RAISED_GRAIN_COLOR = '#5e3517'
+const RAISED_WOOD_SEED = 31
 const FRAME_TINT = 0xb9a08c
 const BASE_COLOR = 0x0c0805
 const WELL_COLOR = 0x050403
@@ -29,6 +33,25 @@ const VISUAL_TILT_GAIN = 1.6
 const WALL_HEIGHT = 0.42
 const WALL_INSET = 1
 const FRAME_HEIGHT = 0.46
+/** World-unit height of a deck's top face above the floor; clears the marble under a bridge. */
+const DECK_HEIGHT = 0.75
+/** Thickness of a bridge plank, in world units. */
+const BRIDGE_THICKNESS = 0.1
+/**
+ * Height of a wall cell that sits beside a deck, bridge or ramp: just proud of the deck, so it still
+ * reads as a wall from up there without hiding the marble behind it in the isometric view.
+ */
+const RAISED_WALL_HEIGHT = DECK_HEIGHT + 0.15
+/** Cross-section (width and thickness) of a ramp's guard rails, in world units. */
+const RAIL_SIZE = 0.06
+/** How far a ramp's guard rails sit above its sloped surface, in world units. */
+const RAIL_RISE = 0.12
+/** How fast the marble falls once it drops off a raised edge, in world units/s^2. */
+const DROP_GRAVITY = 30
+/** Snaps `marbleLift` to its target once the gap closes to this many world units (ramps are continuous). */
+const MARBLE_LIFT_SNAP_EPS = 0.02
+/** Impact speed reported to `events.onImpact` when the marble lands after dropping off a raised edge. */
+const DROP_IMPACT_SPEED = 4
 /** How far the frame's outer edge sits beyond the grid's edge. Negative: a rim thinner than the border cells. */
 const FRAME_EXTEND = -0.4
 const FLOOR_DEPTH = 0.18
@@ -57,8 +80,15 @@ const CAMERA_ELEVATION_DEG = 45
 const CAMERA_ORBIT_DISTANCE = 80
 const CAMERA_FAR = 400
 const CAMERA_MARGIN = 0.06
-const DEMO_SWAY_DEG = 12
-const DEMO_SWAY_PERIOD = 9
+const DEMO_SWAY_DEG = 8
+const DEMO_SWAY_PERIOD = 28
+/**
+ * How the board's drawn tilt follows the simulated one. In play it is immediate and exaggerated so
+ * the player can read it. In the demo the autopilot's quick corrections would make the board
+ * shudder, so the drawn tilt is unexaggerated and eased slowly.
+ */
+const DEMO_VISUAL_TILT_GAIN = 0.9
+const DEMO_VISUAL_TILT_RATE = 2.5
 const AZIMUTH_EASE_RATE = 2
 const MAX_FRAME_DT = 0.1
 /** The fit never treats less than this fraction of the viewport as free, however large the insets. */
@@ -137,30 +167,56 @@ function buildFloor(level: Level, texture: THREE.Texture): { mesh: THREE.Mesh } 
   }
 }
 
+/** True when any of (col, row)'s four orthogonal neighbours is a deck, bridge or ramp cell. */
+function isAdjacentToRaised(level: Level, col: number, row: number): boolean {
+  return [
+    [col + 1, row],
+    [col - 1, row],
+    [col, row + 1],
+    [col, row - 1],
+  ].some(([c, r]) => {
+    const neighbour = cellAt(level, c, r)
+    return neighbour === 'deck' || neighbour === 'bridge' || neighbour === 'ramp'
+  })
+}
+
 /** Interior wall boxes (instanced), the outer framed border, and the base slab beneath it all. */
 function buildWalls(level: Level, texture: THREE.Texture): { group: THREE.Group } & Disposable {
   const { cols, rows, cells } = level
   const group = new THREE.Group()
 
-  const interiorCells: Vec2[] = []
+  interface WallCell {
+    col: number
+    row: number
+    height: number
+  }
+  const interiorCells: WallCell[] = []
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
       if (cells[row * cols + col] !== 'wall') continue
       const onBorder = col === 0 || row === 0 || col === cols - 1 || row === rows - 1
       if (onBorder) continue
-      interiorCells.push({ x: col + 0.5, y: row + 0.5 })
+      const height = isAdjacentToRaised(level, col, row) ? RAISED_WALL_HEIGHT : WALL_HEIGHT
+      interiorCells.push({ col, row, height })
     }
   }
 
-  const wallGeometry = new THREE.BoxGeometry(WALL_INSET, WALL_HEIGHT, WALL_INSET)
+  // Unit-height geometry, scaled per instance so a wall beside a deck/bridge/ramp can stand taller.
+  const wallGeometry = new THREE.BoxGeometry(WALL_INSET, 1, WALL_INSET)
   const wallMaterial = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.75, metalness: 0.05 })
   if (interiorCells.length > 0) {
     const wallsMesh = new THREE.InstancedMesh(wallGeometry, wallMaterial, interiorCells.length)
     wallsMesh.castShadow = true
     wallsMesh.receiveShadow = true
     const matrix = new THREE.Matrix4()
+    const position = new THREE.Vector3()
+    const quaternion = new THREE.Quaternion()
+    const scale = new THREE.Vector3()
     interiorCells.forEach((cell, i) => {
-      matrix.makeTranslation(boardX(cell, cols), WALL_HEIGHT / 2, boardZ(cell, rows))
+      const centre = { x: cell.col + 0.5, y: cell.row + 0.5 }
+      position.set(boardX(centre, cols), cell.height / 2, boardZ(centre, rows))
+      scale.set(1, cell.height, 1)
+      matrix.compose(position, quaternion, scale)
       wallsMesh.setMatrixAt(i, matrix)
     })
     wallsMesh.instanceMatrix.needsUpdate = true
@@ -211,6 +267,156 @@ function buildWalls(level: Level, texture: THREE.Texture): { group: THREE.Group 
       frameMaterial.dispose()
       baseGeometry.dispose()
       baseMaterial.dispose()
+    },
+  }
+}
+
+/**
+ * A wedge prism for one ramp cell, in local unit-cell space, climbing along local +X: the top
+ * surface runs from y = low * DECK_HEIGHT at x = -0.5 to y = high * DECK_HEIGHT at x = 0.5, solid
+ * down to y = 0 on every side. Built from non-indexed triangles (no shared vertices) so
+ * `computeVertexNormals` yields flat per-face shading, with simple top-down planar UVs.
+ */
+function buildRampWedgeGeometry(low: number, high: number): THREE.BufferGeometry {
+  const lowY = low * DECK_HEIGHT
+  const highY = high * DECK_HEIGHT
+  const a0: [number, number, number] = [-0.5, 0, -0.5]
+  const a1: [number, number, number] = [-0.5, 0, 0.5]
+  const b0: [number, number, number] = [0.5, 0, -0.5]
+  const b1: [number, number, number] = [0.5, 0, 0.5]
+  const c0: [number, number, number] = [-0.5, lowY, -0.5]
+  const c1: [number, number, number] = [-0.5, lowY, 0.5]
+  const d0: [number, number, number] = [0.5, highY, -0.5]
+  const d1: [number, number, number] = [0.5, highY, 0.5]
+
+  const triangles: [number, number, number][][] = [
+    [a0, b0, b1], [a0, b1, a1], // bottom
+    [c0, d1, d0], [c0, c1, d1], // sloped top
+    [a0, a1, c1], [a0, c1, c0], // low end (x = -0.5)
+    [b0, d0, d1], [b0, d1, b1], // high end (x = 0.5)
+    [a0, d0, b0], [a0, c0, d0], // back side (z = -0.5)
+    [a1, b1, d1], [a1, d1, c1], // front side (z = 0.5)
+  ]
+
+  const positions: number[] = []
+  const uvs: number[] = []
+  for (const triangle of triangles) {
+    for (const [x, y, z] of triangle) {
+      positions.push(x, y, z)
+      uvs.push(x + 0.5, z + 0.5)
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
+  geometry.computeVertexNormals()
+  return geometry
+}
+
+/** World-Y rotation that turns a wedge built for local +X into one climbing toward `dir` (physics +y is world +z). */
+function rampYaw(dir: Vec2): number {
+  return Math.atan2(-dir.y, dir.x)
+}
+
+/** Adds a ramp cell's two guard rails (local, unrotated) to `group`, following its slope. */
+function addRampRails(group: THREE.Group, low: number, high: number, geometry: THREE.BoxGeometry, material: THREE.Material): void {
+  const lowY = low * DECK_HEIGHT
+  const highY = high * DECK_HEIGHT
+  const tilt = Math.atan2(highY - lowY, 1)
+  const midY = (lowY + highY) / 2 + RAIL_RISE
+  for (const side of [-1, 1]) {
+    const rail = new THREE.Mesh(geometry, material)
+    rail.rotation.z = tilt
+    rail.position.set(0, midY, side * (0.5 - RAIL_SIZE / 2))
+    rail.castShadow = true
+    rail.receiveShadow = true
+    group.add(rail)
+  }
+}
+
+/**
+ * The raised level: solid deck platforms, open bridge planks, and the ramp wedges (with guard
+ * rails) that climb between the ground and the raised level.
+ */
+function buildRaised(level: Level, deckTexture: THREE.Texture, wallTexture: THREE.Texture): { group: THREE.Group } & Disposable {
+  const { cols, rows } = level
+  const group = new THREE.Group()
+
+  const deckCells: Vec2[] = []
+  const bridgeCells: Vec2[] = []
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const cell = cellAt(level, col, row)
+      if (cell === 'deck') deckCells.push({ x: col + 0.5, y: row + 0.5 })
+      else if (cell === 'bridge') bridgeCells.push({ x: col + 0.5, y: row + 0.5 })
+    }
+  }
+
+  const raisedMaterial = new THREE.MeshStandardMaterial({ map: deckTexture, roughness: 0.7, metalness: 0.05 })
+
+  const deckGeometry = new THREE.BoxGeometry(1, DECK_HEIGHT, 1)
+  if (deckCells.length > 0) {
+    const deckMesh = new THREE.InstancedMesh(deckGeometry, raisedMaterial, deckCells.length)
+    deckMesh.castShadow = true
+    deckMesh.receiveShadow = true
+    const matrix = new THREE.Matrix4()
+    deckCells.forEach((cell, i) => {
+      matrix.makeTranslation(boardX(cell, cols), DECK_HEIGHT / 2, boardZ(cell, rows))
+      deckMesh.setMatrixAt(i, matrix)
+    })
+    deckMesh.instanceMatrix.needsUpdate = true
+    group.add(deckMesh)
+  }
+
+  const bridgeGeometry = new THREE.BoxGeometry(1, BRIDGE_THICKNESS, 1)
+  if (bridgeCells.length > 0) {
+    const bridgeMesh = new THREE.InstancedMesh(bridgeGeometry, raisedMaterial, bridgeCells.length)
+    bridgeMesh.castShadow = true
+    bridgeMesh.receiveShadow = true
+    const matrix = new THREE.Matrix4()
+    bridgeCells.forEach((cell, i) => {
+      matrix.makeTranslation(boardX(cell, cols), DECK_HEIGHT - BRIDGE_THICKNESS / 2, boardZ(cell, rows))
+      bridgeMesh.setMatrixAt(i, matrix)
+    })
+    bridgeMesh.instanceMatrix.needsUpdate = true
+    group.add(bridgeMesh)
+  }
+
+  const railGeometry = new THREE.BoxGeometry(1, RAIL_SIZE, RAIL_SIZE)
+  const railMaterial = new THREE.MeshStandardMaterial({ map: wallTexture, roughness: 0.75, metalness: 0.05 })
+  const rampGeometries: THREE.BufferGeometry[] = []
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      if (cellAt(level, col, row) !== 'ramp') continue
+      const ramp = rampAt(level, col, row)
+      if (!ramp) continue
+
+      const wedgeGeometry = buildRampWedgeGeometry(ramp.low, ramp.high)
+      rampGeometries.push(wedgeGeometry)
+      const wedgeMesh = new THREE.Mesh(wedgeGeometry, raisedMaterial)
+      wedgeMesh.castShadow = true
+      wedgeMesh.receiveShadow = true
+
+      const cellGroup = new THREE.Group()
+      cellGroup.add(wedgeMesh)
+      addRampRails(cellGroup, ramp.low, ramp.high, railGeometry, railMaterial)
+      cellGroup.rotation.y = rampYaw(ramp.dir)
+      const centre = { x: col + 0.5, y: row + 0.5 }
+      cellGroup.position.set(boardX(centre, cols), 0, boardZ(centre, rows))
+      group.add(cellGroup)
+    }
+  }
+
+  return {
+    group,
+    dispose() {
+      deckGeometry.dispose()
+      bridgeGeometry.dispose()
+      raisedMaterial.dispose()
+      railGeometry.dispose()
+      railMaterial.dispose()
+      for (const geometry of rampGeometries) geometry.dispose()
     },
   }
 }
@@ -491,12 +697,15 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
   floorTexture.anisotropy = renderer.capabilities.getMaxAnisotropy()
   const wallTexture = makeWoodTexture({ base: WALL_BASE_COLOR, grain: WALL_GRAIN_COLOR, seed: 2 })
   wallTexture.anisotropy = renderer.capabilities.getMaxAnisotropy()
+  const deckTexture = makeWoodTexture({ base: RAISED_BASE_COLOR, grain: RAISED_GRAIN_COLOR, seed: RAISED_WOOD_SEED })
+  deckTexture.anisotropy = renderer.capabilities.getMaxAnisotropy()
 
   // --- Camera --------------------------------------------------------------------------------------
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, CAMERA_FAR)
   let aspect = 1
   const baseAzimuth = THREE.MathUtils.degToRad(CAMERA_AZIMUTH_DEG)
   let azimuth = baseAzimuth
+  const visualTilt = { x: 0, y: 0 }
   let insets: ViewInsets = { left: 0, top: 0, right: 0, bottom: 0 }
   let demoSwayT = 0
 
@@ -522,15 +731,21 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     wallsGroup: THREE.Group
     holesGroup: THREE.Group
     startRingMesh: THREE.Mesh
+    raisedGroup: THREE.Group
   }
   let boardParts: BoardParts | null = null
   let currentLevel: Level | null = null
   let autopilot: ((state: BallState) => Tilt) | null = null
 
-  let state: BallState = { pos: { x: 0, y: 0 }, vel: { x: 0, y: 0 } }
+  let state: BallState = { pos: { x: 0, y: 0 }, vel: { x: 0, y: 0 }, layer: 0 }
   let tilt: Tilt = { x: 0, y: 0 }
   let mode: EngineMode = 'play'
   let paused = false
+
+  // How high the marble mesh currently floats above the floor (world units), and its fall speed
+  // while it is above its resting height and dropping toward it. See `updateMarbleLift`.
+  let marbleLift = 0
+  let marbleLiftVel = 0
 
   let clockRunning = false
   let time = 0
@@ -552,16 +767,19 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     const walls = buildWalls(level, wallTexture)
     const holes = buildHoleDecor(level)
     const startRing = buildStartRing(level)
+    const raised = buildRaised(level, deckTexture, wallTexture)
     return {
       floorMesh: floor.mesh,
       wallsGroup: walls.group,
       holesGroup: holes.group,
       startRingMesh: startRing.mesh,
+      raisedGroup: raised.group,
       dispose() {
         floor.dispose()
         walls.dispose()
         holes.dispose()
         startRing.dispose()
+        raised.dispose()
       },
     }
   }
@@ -570,11 +788,12 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
   function snapMarbleToState(level: Level): void {
     const x = boardX(state.pos, level.cols)
     const z = boardZ(state.pos, level.rows)
-    marbleBuild.mesh.position.set(x, BALL_RADIUS, z)
+    const y = BALL_RADIUS + marbleLift
+    marbleBuild.mesh.position.set(x, y, z)
     marbleBuild.mesh.scale.setScalar(1)
     marbleBuild.mesh.quaternion.set(0, 0, 0, 1)
     marbleBuild.mesh.visible = true
-    lastMarbleWorld.set(x, BALL_RADIUS, z)
+    lastMarbleWorld.set(x, y, z)
   }
 
   /** Resets the marble, clock, falls and sink animation for `level`, keeping its meshes as-is. */
@@ -589,19 +808,33 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     sinkT = 0
     goalSunk = false
     demoRestartTimer = 0
+    marbleLift = 0
+    marbleLiftVel = 0
     snapMarbleToState(level)
   }
 
   function loadLevel(level: Level): void {
     if (boardParts) {
-      boardGroup.remove(boardParts.floorMesh, boardParts.wallsGroup, boardParts.holesGroup, boardParts.startRingMesh)
+      boardGroup.remove(
+        boardParts.floorMesh,
+        boardParts.wallsGroup,
+        boardParts.holesGroup,
+        boardParts.startRingMesh,
+        boardParts.raisedGroup,
+      )
       boardParts.dispose()
     }
     boardParts = buildBoardParts(level)
-    boardGroup.add(boardParts.floorMesh, boardParts.wallsGroup, boardParts.holesGroup, boardParts.startRingMesh)
+    boardGroup.add(
+      boardParts.floorMesh,
+      boardParts.wallsGroup,
+      boardParts.holesGroup,
+      boardParts.startRingMesh,
+      boardParts.raisedGroup,
+    )
 
     currentLevel = level
-    autopilot = createAutopilot(level)
+    autopilot = createAutopilot(level, DEMO_PACE)
     resetRunState(level)
     input.reset()
     fitShadowCamera(level)
@@ -658,6 +891,8 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
           sinkPhase = 'none'
         } else {
           state = startState(currentLevel)
+          marbleLift = 0
+          marbleLiftVel = 0
           sinkPhase = 'popping'
           sinkT = 0
         }
@@ -677,6 +912,7 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     if (clockRunning) time += FIXED_DT
 
     if (mode === 'play' && result.impact > 0) events.onImpact(result.impact)
+    if (mode === 'play' && result.dropped) events.onImpact(DROP_IMPACT_SPEED)
 
     if (result.event === 'fell' && result.sink) {
       beginSink(result.sink, false)
@@ -697,8 +933,29 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
       const axis = new THREE.Vector3(dz, 0, -dx).normalize()
       marbleBuild.mesh.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(axis, dist / BALL_RADIUS))
     }
-    marbleBuild.mesh.position.set(x, BALL_RADIUS, z)
-    lastMarbleWorld.set(x, BALL_RADIUS, z)
+    const y = BALL_RADIUS + marbleLift
+    marbleBuild.mesh.position.set(x, y, z)
+    lastMarbleWorld.set(x, y, z)
+  }
+
+  /**
+   * Advances `marbleLift` toward `heightAt(level, state) * DECK_HEIGHT`: climbing a ramp or
+   * stepping onto a deck/bridge is continuous, so it snaps straight there, but dropping off a
+   * raised edge falls under `DROP_GRAVITY` until it reaches the (lower) target.
+   */
+  function updateMarbleLift(level: Level, dt: number): void {
+    const target = heightAt(level, state) * DECK_HEIGHT
+    if (target >= marbleLift - MARBLE_LIFT_SNAP_EPS) {
+      marbleLift = target
+      marbleLiftVel = 0
+      return
+    }
+    marbleLiftVel += DROP_GRAVITY * dt
+    marbleLift -= marbleLiftVel * dt
+    if (marbleLift <= target) {
+      marbleLift = target
+      marbleLiftVel = 0
+    }
   }
 
   /** Per-render-frame visuals: marble transform/animation, board tilt, camera, particles. */
@@ -726,13 +983,22 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     } else {
       marbleBuild.mesh.visible = true
       marbleBuild.mesh.scale.setScalar(1)
+      updateMarbleLift(level, dt)
       rollMarble(boardX(state.pos, level.cols), boardZ(state.pos, level.rows))
     }
 
     updateParticleBurst(particleBurst, dt)
 
-    boardGroup.rotation.x = tilt.y * VISUAL_TILT_GAIN
-    boardGroup.rotation.z = -tilt.x * VISUAL_TILT_GAIN
+    if (mode === 'demo') {
+      const ease = 1 - Math.exp(-DEMO_VISUAL_TILT_RATE * dt)
+      visualTilt.x += (tilt.x * DEMO_VISUAL_TILT_GAIN - visualTilt.x) * ease
+      visualTilt.y += (tilt.y * DEMO_VISUAL_TILT_GAIN - visualTilt.y) * ease
+    } else {
+      visualTilt.x = tilt.x * VISUAL_TILT_GAIN
+      visualTilt.y = tilt.y * VISUAL_TILT_GAIN
+    }
+    boardGroup.rotation.x = visualTilt.y
+    boardGroup.rotation.z = -visualTilt.x
 
     const sway =
       mode === 'demo'
@@ -776,10 +1042,12 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
 
     const halfWidth = level.cols / 2 + FRAME_EXTEND
     const halfDepth = level.rows / 2 + FRAME_EXTEND
+    const hasRaised = level.cells.some((cell) => cell === 'deck' || cell === 'bridge' || cell === 'ramp')
+    const cornerHeight = hasRaised ? Math.max(FRAME_HEIGHT, RAISED_WALL_HEIGHT) : FRAME_HEIGHT
     const corners: THREE.Vector3[] = []
     for (const x of [-halfWidth, halfWidth]) {
       for (const z of [-halfDepth, halfDepth]) {
-        corners.push(new THREE.Vector3(x, 0, z), new THREE.Vector3(x, FRAME_HEIGHT, z))
+        corners.push(new THREE.Vector3(x, 0, z), new THREE.Vector3(x, cornerHeight, z))
       }
     }
 
@@ -905,6 +1173,7 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
           boardParts.wallsGroup,
           boardParts.holesGroup,
           boardParts.startRingMesh,
+          boardParts.raisedGroup,
         )
         boardParts.dispose()
       }
@@ -912,6 +1181,7 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
       particleBurst.dispose()
       floorTexture.dispose()
       wallTexture.dispose()
+      deckTexture.dispose()
       glowGeometry.dispose()
       glowMaterial.dispose()
       glowTexture.dispose()

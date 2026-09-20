@@ -214,3 +214,266 @@ test('the shortest path is at least as long as the board\'s longer side', () => 
     )
   }
 })
+
+// --- parseLevel: raised cells and ramps --------------------------------------------------------
+
+test('parseLevel maps = to deck and a 3-cell > run to ramp, sharing the climb k/n', () => {
+  const level = parseLevel(
+    def([
+      '#########',
+      '#S......#',
+      '#.......#',
+      '#.>>>=..#',
+      '#......G#',
+      '#########',
+    ]),
+  )
+  const idx = (col: number, row: number): number => row * level.cols + col
+  assert.equal(level.cells[idx(2, 3)], 'ramp')
+  assert.equal(level.cells[idx(3, 3)], 'ramp')
+  assert.equal(level.cells[idx(4, 3)], 'ramp')
+  assert.equal(level.cells[idx(5, 3)], 'deck')
+  assert.deepEqual(level.ramps[idx(2, 3)], { dir: { x: 1, y: 0 }, low: 0, high: 1 / 3 })
+  assert.deepEqual(level.ramps[idx(3, 3)], { dir: { x: 1, y: 0 }, low: 1 / 3, high: 2 / 3 })
+  assert.deepEqual(level.ramps[idx(4, 3)], { dir: { x: 1, y: 0 }, low: 2 / 3, high: 1 })
+  assert.equal(level.ramps[idx(5, 3)], null)
+  assert.equal(level.ramps[idx(1, 3)], null)
+})
+
+test('parseLevel maps < to a ramp climbing west', () => {
+  const level = parseLevel(
+    def([
+      '#########',
+      '#S......#',
+      '#.=<....#',
+      '#.......#',
+      '#......G#',
+      '#########',
+    ]),
+  )
+  const idx = (col: number, row: number): number => row * level.cols + col
+  assert.equal(level.cells[idx(3, 2)], 'ramp')
+  assert.deepEqual(level.ramps[idx(3, 2)], { dir: { x: -1, y: 0 }, low: 0, high: 1 })
+})
+
+test('parseLevel maps ^ to a ramp climbing north (up the grid)', () => {
+  const level = parseLevel(
+    def([
+      '#######',
+      '#S....#',
+      '#..=..#',
+      '#..^..#',
+      '#.....#',
+      '#....G#',
+      '#######',
+    ]),
+  )
+  const idx = (col: number, row: number): number => row * level.cols + col
+  assert.equal(level.cells[idx(3, 3)], 'ramp')
+  assert.deepEqual(level.ramps[idx(3, 3)], { dir: { x: 0, y: -1 }, low: 0, high: 1 })
+})
+
+test('parseLevel maps v to a ramp climbing south (down the grid)', () => {
+  const level = parseLevel(
+    def([
+      '#######',
+      '#S....#',
+      '#.....#',
+      '#..v..#',
+      '#..=..#',
+      '#....G#',
+      '#######',
+    ]),
+  )
+  const idx = (col: number, row: number): number => row * level.cols + col
+  assert.equal(level.cells[idx(3, 3)], 'ramp')
+  assert.deepEqual(level.ramps[idx(3, 3)], { dir: { x: 0, y: 1 }, low: 0, high: 1 })
+})
+
+test('parseLevel maps B to bridge, supported by decks on opposite sides', () => {
+  const level = parseLevel(
+    def([
+      '#########',
+      '#.......#',
+      '#...=...#',
+      '#S..B..G#',
+      '#...=...#',
+      '#.......#',
+      '#########',
+    ]),
+  )
+  const idx = (col: number, row: number): number => row * level.cols + col
+  assert.equal(level.cells[idx(4, 3)], 'bridge')
+  assert.equal(level.ramps[idx(4, 3)], null)
+})
+
+// --- parseLevel: ramp and raised-cell validation ------------------------------------------------
+
+test('parseLevel rejects a ramp whose foot approach is not open ground', () => {
+  assert.throws(
+    () =>
+      parseLevel(
+        def([
+          '#########',
+          '#S......#',
+          '#.......#',
+          '#O>>>=..#',
+          '#......G#',
+          '#########',
+        ]),
+      ),
+    /Level T: ramp foot at row 3, col 2 needs open ground \(not a hole\) at row 3, col 1/,
+  )
+})
+
+test('parseLevel rejects a ramp whose top does not lead to a deck or bridge', () => {
+  assert.throws(
+    () =>
+      parseLevel(
+        def([
+          '#########',
+          '#S......#',
+          '#.......#',
+          '#.>>>...#',
+          '#......G#',
+          '#########',
+        ]),
+      ),
+    /Level T: ramp top at row 3, col 4 must lead to a deck or bridge at row 3, col 5/,
+  )
+})
+
+test('parseLevel rejects a ramp run longer than 3 cells', () => {
+  assert.throws(
+    () =>
+      parseLevel(
+        def([
+          '#########',
+          '#S......#',
+          '#.......#',
+          '#.>>>>=.#',
+          '#......G#',
+          '#########',
+        ]),
+      ),
+    /Level T: ramp at row 3, col 2 is 4 cells long, max 3/,
+  )
+})
+
+test('parseLevel rejects a raised cell orthogonally adjacent to the border', () => {
+  assert.throws(
+    () =>
+      parseLevel(
+        def([
+          '#######',
+          '#S....#',
+          '#=....#',
+          '#.....#',
+          '#....G#',
+          '#######',
+        ]),
+      ),
+    /Level T: raised cell at row 2, col 1 is adjacent to the border/,
+  )
+})
+
+test('parseLevel rejects a bridge without support on two opposite sides', () => {
+  assert.throws(
+    () =>
+      parseLevel(
+        def([
+          '#########',
+          '#S......#',
+          '#.......#',
+          '#.=B....#',
+          '#......G#',
+          '#########',
+        ]),
+      ),
+    /Level T: bridge at row 3, col 3 has no support on two opposite sides/,
+  )
+})
+
+// --- findPath: raised levels ---------------------------------------------------------------------
+
+test('findPath climbs a ramp, crosses a bridge, walks onto a deck and drops off its edge', () => {
+  const level = parseLevel(
+    def([
+      '#######',
+      '#S....#',
+      '#.....#',
+      '#..v..#',
+      '#O=B=O#',
+      '#..=..#',
+      '#.....#',
+      '#.....#',
+      '#....G#',
+      '#######',
+    ]),
+  )
+  const path = findPath(level)
+  assert.ok(path)
+  const p = path as Vec2[]
+  assert.deepEqual(p[0], level.start)
+  assert.deepEqual(p[p.length - 1], level.goal)
+  // The route must pass through the ramp, the bridge, and the deck to get past the hole row.
+  assert.ok(p.some((pt) => pt.x === 3.5 && pt.y === 3.5), 'passes through the ramp')
+  assert.ok(p.some((pt) => pt.x === 3.5 && pt.y === 4.5), 'crosses the bridge')
+  assert.ok(p.some((pt) => pt.x === 3.5 && pt.y === 5.5), 'walks onto the deck')
+})
+
+test('findPath crosses a bridge over a hole row only via the ramp', () => {
+  const level = parseLevel(
+    def([
+      '#######',
+      '#S....#',
+      '#.....#',
+      '#..v..#',
+      '#O=B=O#',
+      '#.....#',
+      '#....G#',
+      '#######',
+    ]),
+  )
+  const path = findPath(level)
+  assert.ok(path)
+  const p = path as Vec2[]
+  assert.ok(p.some((pt) => pt.x === 3.5 && pt.y === 3.5), 'climbs the ramp')
+  assert.ok(p.some((pt) => pt.x === 3.5 && pt.y === 4.5), 'crosses the bridge cell in the hole row')
+})
+
+test('findPath passes under a bridge on the ground layer', () => {
+  const level = parseLevel(
+    def([
+      '#########',
+      '#.......#',
+      '#...=...#',
+      '#S..B..G#',
+      '#...=...#',
+      '#.......#',
+      '#########',
+    ]),
+  )
+  const path = findPath(level)
+  assert.ok(path)
+  const p = path as Vec2[]
+  assert.deepEqual(p[0], level.start)
+  assert.deepEqual(p[p.length - 1], level.goal)
+  assert.ok(p.some((pt) => pt.x === 4.5 && pt.y === 3.5), 'passes through the bridge cell')
+  assert.equal(p.length, 7, 'the direct route straight through the bridge')
+})
+
+test('findPath returns null when the goal is beyond a deck with no ramp to reach it', () => {
+  const level = parseLevel(
+    def([
+      '#######',
+      '#S....#',
+      '#.....#',
+      '##===##',
+      '#.....#',
+      '#....G#',
+      '#######',
+    ]),
+  )
+  assert.equal(findPath(level), null)
+})

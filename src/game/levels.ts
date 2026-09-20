@@ -1,15 +1,225 @@
-import type { Cell, Level, LevelDef, Vec2 } from './types.ts'
+import type { Cell, Layer, Level, LevelDef, Ramp, Vec2 } from './types.ts'
+import { type CellRef, cellAt, isOpen, layerAfter } from './board.ts'
 
 /** Smallest a level grid may be, in either dimension. */
 const MIN_LEVEL_SIZE = 3
 
-/** Maps the characters allowed in a `LevelDef` row to the `Cell` they represent. */
+/** Longest a single ramp run may be, in cells. */
+const MAX_RAMP_LENGTH = 3
+
+/**
+ * Maps the characters allowed in a `LevelDef` row to the `Cell` they represent: `#` wall, `.`
+ * floor, `O` hole, `S` start, `G` goal, `=` deck, `B` bridge, and `>` `<` `^` `v` a ramp cell
+ * (see `RAMP_DIR_BY_CHAR` for each arrow's climb direction).
+ */
 const CHAR_TO_CELL: Record<string, Cell> = {
   '#': 'wall',
   '.': 'floor',
   O: 'hole',
   S: 'start',
   G: 'goal',
+  '=': 'deck',
+  B: 'bridge',
+  '>': 'ramp',
+  '<': 'ramp',
+  '^': 'ramp',
+  v: 'ramp',
+}
+
+/** The characters that denote a ramp cell, and the unit step toward each one's high end. */
+const RAMP_DIR_BY_CHAR: Record<string, Vec2> = {
+  '>': { x: 1, y: 0 },
+  '<': { x: -1, y: 0 },
+  '^': { x: 0, y: -1 },
+  v: { x: 0, y: 1 },
+}
+
+/** Ground cells a ramp may legally start from: not a hole, wall, or raised cell. */
+const RAMP_FOOT_APPROACH: ReadonlySet<Cell> = new Set<Cell>(['floor', 'start', 'goal'])
+
+/** Cells a ramp may legally lead into at its high end. */
+const RAMP_TOP_LANDING: ReadonlySet<Cell> = new Set<Cell>(['deck', 'bridge'])
+
+/** Neighbour offsets for 4-connected movement. */
+const NEIGHBOUR_OFFSETS: ReadonlyArray<readonly [number, number]> = [
+  [0, -1],
+  [0, 1],
+  [-1, 0],
+  [1, 0],
+]
+
+/** The cell at (col, row), or null when that position is outside the grid. */
+function cellAtIndex(cells: Cell[], cols: number, rowCount: number, col: number, row: number): Cell | null {
+  if (col < 0 || row < 0 || col >= cols || row >= rowCount) return null
+  return cells[row * cols + col]
+}
+
+/**
+ * Scans one ramp run starting at `startCol`, `startRow` and walking in `step` (which must match
+ * the run's own climb axis), filling `ramps` with each cell's `low`/`high` share and validating
+ * the run: it must be at most `MAX_RAMP_LENGTH` cells, the ground cell before its foot must be
+ * open ground (not a hole), and the cell after its top must be a deck or bridge. Returns the
+ * number of cells consumed, so the caller can skip past the run.
+ */
+function fillRampRun(
+  id: string,
+  rows: string[],
+  cols: number,
+  cells: Cell[],
+  ramps: (Ramp | null)[],
+  ch: string,
+  startCol: number,
+  startRow: number,
+  step: readonly [number, number],
+): number {
+  const [stepX, stepY] = step
+  const dir = RAMP_DIR_BY_CHAR[ch]
+  const rowCount = rows.length
+
+  let n = 0
+  while (true) {
+    const col = startCol + stepX * n
+    const row = startRow + stepY * n
+    if (col < 0 || row < 0 || col >= cols || row >= rowCount || rows[row][col] !== ch) break
+    n++
+  }
+
+  // The run walks from its foot toward its top when `step` matches `dir`, and the other way
+  // around when the character climbs opposite to the scan direction (e.g. '<' scanned west-to-east).
+  const scanIsTowardHigh = stepX === dir.x && stepY === dir.y
+  const footCol = scanIsTowardHigh ? startCol : startCol + stepX * (n - 1)
+  const footRow = scanIsTowardHigh ? startRow : startRow + stepY * (n - 1)
+  const topCol = scanIsTowardHigh ? startCol + stepX * (n - 1) : startCol
+  const topRow = scanIsTowardHigh ? startRow + stepY * (n - 1) : startRow
+
+  if (n > MAX_RAMP_LENGTH) {
+    throw new Error(`Level ${id}: ramp at row ${footRow}, col ${footCol} is ${n} cells long, max ${MAX_RAMP_LENGTH}`)
+  }
+
+  const beforeCol = footCol - dir.x
+  const beforeRow = footRow - dir.y
+  const before = cellAtIndex(cells, cols, rowCount, beforeCol, beforeRow)
+  if (before === null || !RAMP_FOOT_APPROACH.has(before)) {
+    throw new Error(
+      `Level ${id}: ramp foot at row ${footRow}, col ${footCol} needs open ground (not a hole) at row ${beforeRow}, col ${beforeCol}`,
+    )
+  }
+
+  const afterCol = topCol + dir.x
+  const afterRow = topRow + dir.y
+  const after = cellAtIndex(cells, cols, rowCount, afterCol, afterRow)
+  if (after === null || !RAMP_TOP_LANDING.has(after)) {
+    throw new Error(
+      `Level ${id}: ramp top at row ${topRow}, col ${topCol} must lead to a deck or bridge at row ${afterRow}, col ${afterCol}`,
+    )
+  }
+
+  for (let i = 0; i < n; i++) {
+    const col = startCol + stepX * i
+    const row = startRow + stepY * i
+    const k = scanIsTowardHigh ? i : n - 1 - i
+    ramps[row * cols + col] = { dir, low: k / n, high: (k + 1) / n }
+  }
+
+  return n
+}
+
+/**
+ * Builds and validates the `ramps` grid for a level: finds every maximal straight run of the same
+ * ramp character (horizontal runs for `>` `<`, vertical runs for `^` `v`) and fills each cell's
+ * `low`/`high` share of the climb, throwing on any rule a run breaks.
+ */
+function buildRamps(id: string, rows: string[], cols: number, cells: Cell[]): (Ramp | null)[] {
+  const rowCount = rows.length
+  const ramps: (Ramp | null)[] = new Array(cols * rowCount).fill(null)
+
+  for (let row = 0; row < rowCount; row++) {
+    let col = 0
+    while (col < cols) {
+      const c = rows[row][col]
+      if (c === '>' || c === '<') {
+        col += fillRampRun(id, rows, cols, cells, ramps, c, col, row, [1, 0])
+      } else {
+        col++
+      }
+    }
+  }
+
+  for (let col = 0; col < cols; col++) {
+    let row = 0
+    while (row < rowCount) {
+      const c = rows[row][col]
+      if (c === '^' || c === 'v') {
+        row += fillRampRun(id, rows, cols, cells, ramps, c, col, row, [0, 1])
+      } else {
+        row++
+      }
+    }
+  }
+
+  return ramps
+}
+
+/**
+ * Validates that no `deck`, `bridge` or `ramp` cell is orthogonally adjacent to the outer border
+ * ring, keeping raised things one cell away from the board's frame.
+ */
+function validateRaisedBorderDistance(id: string, cols: number, rowCount: number, cells: Cell[]): void {
+  for (let row = 0; row < rowCount; row++) {
+    for (let col = 0; col < cols; col++) {
+      const cell = cells[row * cols + col]
+      if (cell !== 'deck' && cell !== 'bridge' && cell !== 'ramp') continue
+      for (const [dx, dy] of NEIGHBOUR_OFFSETS) {
+        const nRow = row + dy
+        const nCol = col + dx
+        const onBorder = nRow === 0 || nRow === rowCount - 1 || nCol === 0 || nCol === cols - 1
+        if (onBorder) {
+          throw new Error(`Level ${id}: raised cell at row ${row}, col ${col} is adjacent to the border`)
+        }
+      }
+    }
+  }
+}
+
+/**
+ * True when the cell at (col, row) supports a bridge from the direction (towardX, towardY) points
+ * away from it: a deck or bridge cell always supports, and a ramp cell supports only when its top
+ * faces back toward the bridge.
+ */
+function supportsBridge(
+  cells: Cell[],
+  ramps: (Ramp | null)[],
+  cols: number,
+  rowCount: number,
+  col: number,
+  row: number,
+  towardX: number,
+  towardY: number,
+): boolean {
+  const cell = cellAtIndex(cells, cols, rowCount, col, row)
+  if (cell === 'deck' || cell === 'bridge') return true
+  if (cell !== 'ramp') return false
+  const ramp = ramps[row * cols + col]
+  return ramp !== null && ramp.dir.x === towardX && ramp.dir.y === towardY && ramp.high === 1
+}
+
+/**
+ * Validates that every `bridge` cell spans something: it needs a deck, bridge, or ramp top on
+ * both its west and east neighbours, or on both its north and south neighbours.
+ */
+function validateBridgeSupport(id: string, cols: number, rowCount: number, cells: Cell[], ramps: (Ramp | null)[]): void {
+  for (let row = 0; row < rowCount; row++) {
+    for (let col = 0; col < cols; col++) {
+      if (cells[row * cols + col] !== 'bridge') continue
+      const west = supportsBridge(cells, ramps, cols, rowCount, col - 1, row, 1, 0)
+      const east = supportsBridge(cells, ramps, cols, rowCount, col + 1, row, -1, 0)
+      const north = supportsBridge(cells, ramps, cols, rowCount, col, row - 1, 0, 1)
+      const south = supportsBridge(cells, ramps, cols, rowCount, col, row + 1, 0, -1)
+      if (!((west && east) || (north && south))) {
+        throw new Error(`Level ${id}: bridge at row ${row}, col ${col} has no support on two opposite sides`)
+      }
+    }
+  }
 }
 
 /**
@@ -79,84 +289,98 @@ export function parseLevel(def: LevelDef): Level {
     }
   }
 
-  return { id, name, par, cols, rows: rows.length, cells, start: start!, goal: goal!, holes }
+  const ramps = buildRamps(id, rows, cols, cells)
+  validateRaisedBorderDistance(id, cols, rows.length, cells)
+  validateBridgeSupport(id, cols, rows.length, cells, ramps)
+
+  return { id, name, par, cols, rows: rows.length, cells, start: start!, goal: goal!, holes, ramps }
 }
 
-/** Neighbour offsets for 4-connected movement, used by `findPath`. */
-const NEIGHBOUR_OFFSETS: ReadonlyArray<readonly [number, number]> = [
-  [0, -1],
-  [0, 1],
-  [-1, 0],
-  [1, 0],
-]
-
 /**
- * Finds a shortest route from `level.start` to `level.goal` over 4-connected floor/start/goal
- * cells (walls and holes both block movement), returning the centre of every cell on the route
- * from start to goal inclusive, or `null` if no such route exists.
+ * Finds a shortest route from `level.start` to `level.goal`, both on the ground layer, moving
+ * 4-connected between (col, row, layer) states via `isOpen`/`layerAfter` so it agrees with the
+ * physics about where the marble may roll: onto a ramp only at its foot (from the ground) or its
+ * top (from the raised level), across a bridge on either layer, and off a raised edge as a legal
+ * drop. Never routes through a hole cell while on the ground layer, even if the step that would
+ * land there is otherwise open. Returns the centre of every cell on the route, start to goal
+ * inclusive, or `null` if no such route exists.
  */
 export function findPath(level: Level): Vec2[] | null {
-  const { cols, rows, cells } = level
+  const { cols, rows: rowCount } = level
   const startCol = Math.floor(level.start.x)
   const startRow = Math.floor(level.start.y)
   const goalCol = Math.floor(level.goal.x)
   const goalRow = Math.floor(level.goal.y)
 
-  const isOpen = (col: number, row: number): boolean => {
-    const cell = cells[row * cols + col]
-    return cell === 'floor' || cell === 'start' || cell === 'goal'
-  }
+  const key = (col: number, row: number, layer: Layer): number => (row * cols + col) * 2 + layer
 
-  const visited = new Uint8Array(cols * rows)
-  const prev = new Int32Array(cols * rows).fill(-1)
-  const startIndex = startRow * cols + startCol
-  const goalIndex = goalRow * cols + goalCol
-  visited[startIndex] = 1
+  const stateCount = cols * rowCount * 2
+  const visited = new Uint8Array(stateCount)
+  const prev = new Int32Array(stateCount).fill(-1)
 
-  const queue: number[] = [startIndex]
+  const startKey = key(startCol, startRow, 0)
+  const goalKey = key(goalCol, goalRow, 0)
+  visited[startKey] = 1
+
+  const queue: number[] = [startKey]
   let head = 0
-  let found = startIndex === goalIndex
+  let found = startKey === goalKey
+
   while (head < queue.length && !found) {
-    const index = queue[head++]
-    const col = index % cols
-    const row = (index - col) / cols
+    const stateIndex = queue[head++]
+    const layer = (stateIndex % 2) as Layer
+    const cellIndex = (stateIndex - layer) / 2
+    const col = cellIndex % cols
+    const row = (cellIndex - col) / cols
+    const from: CellRef = { col, row }
+
     for (const [dx, dy] of NEIGHBOUR_OFFSETS) {
-      const nextCol = col + dx
-      const nextRow = row + dy
-      if (nextCol < 0 || nextRow < 0 || nextCol >= cols || nextRow >= rows) continue
-      if (!isOpen(nextCol, nextRow)) continue
-      const nextIndex = nextRow * cols + nextCol
-      if (visited[nextIndex]) continue
-      visited[nextIndex] = 1
-      prev[nextIndex] = index
-      queue.push(nextIndex)
-      if (nextIndex === goalIndex) {
+      const to: CellRef = { col: col + dx, row: row + dy }
+      if (to.col < 0 || to.row < 0 || to.col >= cols || to.row >= rowCount) continue
+      if (!isOpen(level, from, layer, to)) continue
+
+      const newLayer = layerAfter(level, from, layer, to)
+      if (newLayer === 0 && cellAt(level, to.col, to.row) === 'hole') continue
+
+      const nextKey = key(to.col, to.row, newLayer)
+      if (visited[nextKey]) continue
+      visited[nextKey] = 1
+      prev[nextKey] = stateIndex
+      queue.push(nextKey)
+      if (nextKey === goalKey) {
         found = true
         break
       }
     }
   }
 
-  if (!visited[goalIndex]) return null
+  if (!visited[goalKey]) return null
 
   const path: Vec2[] = []
-  let cur = goalIndex
+  let cur = goalKey
   while (cur !== -1) {
-    const col = cur % cols
-    const row = (cur - col) / cols
+    const layer = (cur % 2) as Layer
+    const cellIndex = (cur - layer) / 2
+    const col = cellIndex % cols
+    const row = (cellIndex - col) / cols
     path.push({ x: col + 0.5, y: row + 0.5 })
-    cur = cur === startIndex ? -1 : prev[cur]
+    cur = cur === startKey ? -1 : prev[cur]
   }
   path.reverse()
   return path
 }
 
 /**
- * The 12 shipped levels. They alternate between walled mazes with pits in the dead ends and open
- * boards where the route is a bridge or a slalom between pits. Grids are laid out one string per
- * row so their shape reads directly from the source. Each `par` is set from the autopilot's time
- * (`npm run solve`): about 0.85 of it on the mazes and about the same as it on the open boards,
- * where a player cannot safely outrun the bot by much.
+ * The 12 shipped levels, in menu order. Flat boards — walled mazes with pits in the dead ends, and
+ * open boards where the route threads between pits — alternate with two-level boards: ramps up to
+ * decks, bridges that are rolled under and later over, rooms joined only over the top of a wall,
+ * and cups that can only be reached by dropping off a deck. Grids are laid out one string per row
+ * so their shape reads directly from the source.
+ *
+ * `id` is the key a player's best time is saved under, so a board keeps its id for life and a new
+ * board gets a fresh one; ids say nothing about menu order. Each `par` is set from the autopilot's
+ * time (`npm run solve`): about 0.85 of it on the mazes and about the same as it on the open
+ * boards, where a player cannot safely outrun the bot by much.
  */
 export const LEVEL_DEFS: LevelDef[] = [
   {
@@ -174,19 +398,17 @@ export const LEVEL_DEFS: LevelDef[] = [
     ],
   },
   {
-    id: '02',
-    name: 'Pillar Room',
-    par: 6,
+    id: '13',
+    name: 'Up and Over',
+    par: 7,
     rows: [
-      '#########',
-      '#S......#',
-      '#.##.##.#',
-      '#.#.O.#.#',
-      '#.#...#.#',
-      '#.#.O.#.#',
-      '#.#####.#',
-      '#......G#',
-      '#########',
+      '#############',
+      '#S....#....G#',
+      '#.....#.....#',
+      '#..>=====<..#',
+      '#.....#.....#',
+      '#.....#.....#',
+      '#############',
     ],
   },
   {
@@ -201,6 +423,22 @@ export const LEVEL_DEFS: LevelDef[] = [
       '#....O....#',
       '#....O....#',
       '###########',
+    ],
+  },
+  {
+    id: '14',
+    name: 'Underpass',
+    par: 10,
+    rows: [
+      '#############',
+      '#S....#.....#',
+      '#.....=<<...#',
+      '#..O..=...O.#',
+      '#.....B.....#',
+      '#..O##=.....#',
+      '#..#G.=.O...#',
+      '#...##......#',
+      '#############',
     ],
   },
   {
@@ -222,51 +460,39 @@ export const LEVEL_DEFS: LevelDef[] = [
     ],
   },
   {
-    id: '05',
-    name: 'The Bridge',
-    par: 7,
+    id: '15',
+    name: 'Drawbridge',
+    par: 9,
     rows: [
-      '#############',
-      '#S..OOOOO..G#',
-      '#...OOOOO...#',
-      '#...........#',
-      '#...OOOOO...#',
-      '#...OOOOO...#',
-      '#############',
+      '###############',
+      '#S....OOO.....#',
+      '#..O..OOO..O..#',
+      '#.....OOO.....#',
+      '#..>>=BBB=<<..#',
+      '#.....OOO.....#',
+      '#..O..OOO..O..#',
+      '#.....OOO....G#',
+      '###############',
     ],
   },
   {
-    id: '06',
-    name: 'Four Corners',
-    par: 15,
+    id: '16',
+    name: 'Four Rooms',
+    par: 13,
     rows: [
-      '###########',
-      '#G#O#....O#',
-      '#.#.#.#.###',
-      '#.#...#...#',
-      '#.###.###.#',
-      '#...#..S#.#',
-      '###.#####.#',
-      '#O#...#...#',
-      '#.###.#.#.#',
-      '#.......#O#',
-      '###########',
-    ],
-  },
-  {
-    id: '07',
-    name: 'Swiss Cheese',
-    par: 7,
-    rows: [
-      '###########',
-      '#S...O....#',
-      '#..O...O..#',
-      '#.O..O...O#',
-      '#...O..O..#',
-      '#O.O..O...#',
-      '#....O..O.#',
-      '#.O.O....G#',
-      '###########',
+      '###############',
+      '#S.....#.....G#',
+      '#......#..O...#',
+      '#..O...#......#',
+      '#.....O#...O..#',
+      '#......#O.....#',
+      '###.#######.###',
+      '#......#O.....#',
+      '#O.....#....O.#',
+      '#..>>===<<....#',
+      '#......#......#',
+      '#O...O.#..O...#',
+      '###############',
     ],
   },
   {
@@ -286,60 +512,40 @@ export const LEVEL_DEFS: LevelDef[] = [
     ],
   },
   {
-    id: '09',
-    name: 'The Gauntlet',
-    par: 20,
-    rows: [
-      '#############',
-      '#OO...#...OO#',
-      '#####.#.#.###',
-      '#...#.#S#...#',
-      '#.#.#.#####.#',
-      '#.#.#...#...#',
-      '#.#.###.#.###',
-      '#.#..O#.#...#',
-      '#.#.###.###.#',
-      '#.#G#...#...#',
-      '#.###.###.#.#',
-      '#.........#O#',
-      '#############',
-    ],
-  },
-  {
-    id: '10',
-    name: 'Causeway',
-    par: 9,
-    rows: [
-      '#############',
-      '#S.OOOOOOOOO#',
-      '#..OOOOOOOOO#',
-      '#O...OOOOOOO#',
-      '#OOO.OOOOOOO#',
-      '#OOO....OOOO#',
-      '#OOOOOO.OOOO#',
-      '#OOOOOO...OO#',
-      '#OOOOOOOO.OO#',
-      '#OOOOOOOO..G#',
-      '#############',
-    ],
-  },
-  {
-    id: '11',
-    name: 'Spiral Vault',
-    par: 27,
+    id: '17',
+    name: 'Mezzanine',
+    par: 13,
     rows: [
       '###############',
-      '#G#.....#OO...#',
-      '#.#.###.#####.#',
-      '#.#...#.......#',
-      '#.###.#######.#',
-      '#...#.....#OO.#',
-      '###.###O#.###.#',
-      '#O#...#O#...#.#',
-      '#.###.#####.#.#',
-      '#...#.#.....#.#',
-      '#.#.#.#.#####.#',
-      '#O#.....#S....#',
+      '#.............#',
+      '#......O......#',
+      '#...======###.#',
+      '#...=#=##=.G#.#',
+      '#.>>===#==###.#',
+      '#...=#===#....#',
+      '#...===#==.O..#',
+      '#.O...........#',
+      '#.........O..S#',
+      '###############',
+    ],
+  },
+  {
+    id: '18',
+    name: 'Crossroads',
+    par: 18,
+    rows: [
+      '###############',
+      '#######......O#',
+      '#S..#..v..#...#',
+      '#.#.#..v..#.#.#',
+      '#.#...#=#...#.#',
+      '#.####.=.####.#',
+      '#......B......#',
+      '#.####.=.####.#',
+      '######.=.######',
+      '#######.#######',
+      '#.....O.O.....#',
+      '#G............#',
       '###############',
     ],
   },
@@ -363,7 +569,26 @@ export const LEVEL_DEFS: LevelDef[] = [
       '###############',
     ],
   },
+  {
+    id: '19',
+    name: 'Citadel',
+    par: 16,
+    rows: [
+      '###############',
+      '#.............#',
+      '#..OOOOOOO..O.#',
+      '#..O#####O....#',
+      '#.#O#...#O.#.##',
+      '#..O#.G.#O....#',
+      '##.O#...=B<<..#',
+      '#..O#.O.#O....#',
+      '#.#O#...#O.##.#',
+      '#..O#####O....#',
+      '#..OOOOOOO..O.#',
+      '#S......#.....#',
+      '###############',
+    ],
+  },
 ]
 
-/** The 12 shipped levels, parsed and validated. */
 export const LEVELS: Level[] = LEVEL_DEFS.map(parseLevel)

@@ -2,6 +2,17 @@
 
 All notable changes to Marble Tilt are documented in this file, following the [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [1.2.0] - 2026-09-20
+
+### Added
+
+- Two-storey boards. Ramps climb to a raised level of decks and bridges; a ramp pulls the marble back down, so it takes some speed or a held tilt to climb. Bridges can be rolled over and under, and rolling off the edge of a deck or a bridge drops the marble back to the floor with a wooden knock.
+- Seven new levels built from ramps, bridges, rooms, and small mazes: Up and Over, Underpass, Drawbridge, Four Rooms, Mezzanine, Crossroads, and Citadel. They replace Pillar Room, The Bridge, Four Corners, Swiss Cheese, The Gauntlet, Causeway, and Spiral Vault; the game still has twelve levels, and best times on the five levels that stayed are kept.
+
+### Changed
+
+- The board behind the menu is much calmer. The demo marble rolls at an unhurried pace and only slows for corners instead of braking at every cell, the board eases into each tilt rather than snapping to it, and the camera sways more slowly. Before, the board rocked back and forth several times a second.
+
 ## [1.1.0] - 2026-09-20
 
 ### Changed
