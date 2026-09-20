@@ -34,6 +34,23 @@ export function keysToTilt(keys: { left: boolean; right: boolean; up: boolean; d
 }
 
 /**
+ * Turns a screen-relative tilt (x toward the right of the screen, y toward the bottom) into board
+ * space for a camera that orbits the board at `azimuth` radians (0 looks along the board's +y axis
+ * from the near side). Magnitude is preserved. Non-finite input gives a level board.
+ */
+export function rotateTilt(tilt: Tilt, azimuth: number): Tilt {
+  if (!Number.isFinite(tilt.x) || !Number.isFinite(tilt.y) || !Number.isFinite(azimuth)) {
+    return { x: 0, y: 0 }
+  }
+  const cos = Math.cos(azimuth)
+  const sin = Math.sin(azimuth)
+  return {
+    x: tilt.x * cos + tilt.y * sin,
+    y: -tilt.x * sin + tilt.y * cos,
+  }
+}
+
+/**
  * Maps a device orientation reading to a tilt: the offset from `neutral` (in degrees), rotated to
  * account for the screen's current rotation, then scaled so FULL_DEVICE_TILT_DEG of device
  * rotation produces MAX_TILT. An unrecognised `screenAngle` is treated as portrait (0). Non-finite

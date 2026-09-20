@@ -2,6 +2,14 @@
 
 All notable changes to Marble Tilt are documented in this file, following the [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [1.1.0] - 2026-09-20
+
+### Changed
+
+- The board is now drawn in a true isometric view: a parallel projection looking along the board's diagonal, so it reads as a solid wooden box with no perspective distortion. Before, a steep perspective camera made the far edge of the board look pinched.
+- Mouse, touch, and phone-tilt steering still follow the screen: push right and the marble rolls to the right of the screen. The arrow keys and WASD now roll the marble along the board's rows and columns, which run diagonally on screen (Up is up-right, Right is down-right).
+- Walls and the frame are lower so the marble and the pits stay visible behind them from the lower camera.
+
 ## [1.0.0] - 2026-09-20
 
 ### Added

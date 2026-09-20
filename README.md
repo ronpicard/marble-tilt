@@ -5,7 +5,7 @@ Marble Tilt is a 3D wooden labyrinth that runs in the browser. Tilt the board wi
 ## How to play
 
 - Mouse: move the cursor away from the centre of the window to tilt the board toward it; the farther out, the steeper. Move the cursor out of the window and the board returns to flat.
-- Keyboard: arrow keys or WASD tilt the board toward the held direction; holding two keys tilts diagonally.
+- Keyboard: arrow keys or WASD roll the marble along the board's own rows and columns, which run diagonally across the isometric view: Up is up-right, Right is down-right, Down is down-left, and Left is up-left. Holding two keys tilts between them.
 - Touch: drag anywhere on the board like a virtual joystick — the farther from where you first touched, the steeper the tilt. Release to flatten.
 - Phone tilt: turn on "Tilt with your phone" from the menu, then tilt your device itself. iOS asks for a one-time motion-access permission the first time you tap the toggle; allow it to steer by tilt. A recentre button appears during play to make your phone's current pose the new "flat," in case you weren't holding it level when you turned tilt on.
 - `R` restarts the current level from the start, and `Escape` returns to the menu at any point during play.
@@ -55,7 +55,7 @@ Both the pathfinding and the autopilot are covered by their own test files along
 ## Tech stack
 
 - React 19 and TypeScript for the menu, HUD, and result screens
-- Plain three.js for the 3D board, marble, wood textures, and lighting
+- Plain three.js for the 3D board, marble, wood textures, and lighting, drawn through an isometric (parallel-projection) camera that looks along the board's diagonal
 - Vite for building and development
 - Web Audio, synthesised in code at runtime — no audio files shipped with the app
 - Node's built-in test runner (`node:test`), no separate test framework

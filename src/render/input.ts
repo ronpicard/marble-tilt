@@ -1,6 +1,6 @@
 import type { Tilt } from '../game/types.ts'
 import type { Pose } from '../game/tilt.ts'
-import { keysToTilt, orientationToTilt, pointerToTilt } from '../game/tilt.ts'
+import { keysToTilt, orientationToTilt, pointerToTilt, rotateTilt } from '../game/tilt.ts'
 import type { MotionStatus } from './engineApi.ts'
 
 /** Degrees of device-orientation drift from neutral below which motion input is ignored. */
@@ -46,6 +46,11 @@ interface DeviceOrientationEventWithPermission {
   requestPermission?: () => Promise<'granted' | 'denied'>
 }
 
+export interface TiltInputOptions {
+  /** Azimuth of the camera in radians. Mouse, touch and motion tilts are screen-relative and are rotated by it into board space. */
+  viewAzimuth?: number
+}
+
 export interface TiltInput {
   /** The tilt the player is asking for right now. */
   getTarget(): Tilt
@@ -74,7 +79,8 @@ function currentScreenAngle(): number {
  * order: keyboard (while any steering key is held), then device motion (once enabled), then the
  * pointer (mouse hover, or a touch/pen virtual joystick).
  */
-export function createTiltInput(element: HTMLElement): TiltInput {
+export function createTiltInput(element: HTMLElement, options: TiltInputOptions = {}): TiltInput {
+  const { viewAzimuth = 0 } = options
   const keys: KeyState = { left: false, right: false, up: false, down: false }
   let moved = false
 
@@ -178,13 +184,14 @@ export function createTiltInput(element: HTMLElement): TiltInput {
 
   return {
     getTarget(): Tilt {
+      // Keys steer along the board's own axes, which in an isometric view are the screen diagonals, so they are not rotated.
       if (anyKeyHeld()) return keysToTilt(keys)
       if (motionEnabled) {
         if (!latestPose || !neutralPose) return { x: 0, y: 0 }
-        return orientationToTilt(latestPose, neutralPose, currentScreenAngle())
+        return rotateTilt(orientationToTilt(latestPose, neutralPose, currentScreenAngle()), viewAzimuth)
       }
-      if (activeTouchPointerId !== null) return touchTilt
-      return mouseReady ? mouseTilt : { x: 0, y: 0 }
+      if (activeTouchPointerId !== null) return rotateTilt(touchTilt, viewAzimuth)
+      return mouseReady ? rotateTilt(mouseTilt, viewAzimuth) : { x: 0, y: 0 }
     },
 
     hasMoved(): boolean {

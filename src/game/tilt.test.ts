@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { MAX_TILT } from './physics.ts'
-import { FULL_DEVICE_TILT_DEG, keysToTilt, orientationToTilt, pointerToTilt } from './tilt.ts'
+import { FULL_DEVICE_TILT_DEG, keysToTilt, orientationToTilt, pointerToTilt, rotateTilt } from './tilt.ts'
 
 const EPS = 1e-9
 
@@ -124,5 +124,50 @@ describe('orientationToTilt', () => {
     const tilt = orientationToTilt({ beta: NaN, gamma: Infinity }, neutral, 0)
     assert.equal(tilt.x, 0)
     assert.equal(tilt.y, 0)
+  })
+})
+
+describe('rotateTilt', () => {
+  it('is the identity at azimuth 0', () => {
+    const tilt = rotateTilt({ x: 3, y: -4 }, 0)
+    assert.ok(Math.abs(tilt.x - 3) < EPS)
+    assert.ok(Math.abs(tilt.y - -4) < EPS)
+  })
+
+  it('rotates a pure screen-right tilt at azimuth PI/4', () => {
+    const m = 5
+    const cos45 = Math.SQRT1_2
+    const tilt = rotateTilt({ x: m, y: 0 }, Math.PI / 4)
+    assert.ok(Math.abs(tilt.x - m * cos45) < EPS)
+    assert.ok(Math.abs(tilt.y - -m * cos45) < EPS)
+  })
+
+  it('rotates a pure screen-down tilt at azimuth PI/4', () => {
+    const m = 5
+    const cos45 = Math.SQRT1_2
+    const tilt = rotateTilt({ x: 0, y: m }, Math.PI / 4)
+    assert.ok(Math.abs(tilt.x - m * cos45) < EPS)
+    assert.ok(Math.abs(tilt.y - m * cos45) < EPS)
+  })
+
+  it('preserves magnitude for an arbitrary angle', () => {
+    const input = { x: 7, y: -2 }
+    const tilt = rotateTilt(input, 1.23456)
+    assert.ok(Math.abs(Math.hypot(tilt.x, tilt.y) - Math.hypot(input.x, input.y)) < EPS)
+  })
+
+  it('is zero when the tilt or azimuth is non-finite', () => {
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      assert.deepEqual(rotateTilt({ x: bad, y: 1 }, 0), { x: 0, y: 0 })
+      assert.deepEqual(rotateTilt({ x: 1, y: bad }, 0), { x: 0, y: 0 })
+      assert.deepEqual(rotateTilt({ x: 1, y: 1 }, bad), { x: 0, y: 0 })
+    }
+  })
+
+  it('does not mutate the input object', () => {
+    const input = { x: 3, y: -4 }
+    const copy = { ...input }
+    rotateTilt(input, Math.PI / 4)
+    assert.deepEqual(input, copy)
   })
 })

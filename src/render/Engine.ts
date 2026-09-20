@@ -26,15 +26,19 @@ const GLOW_PLANE_COLOR = 0xff8a3d
 
 /** Extra visual rotation applied to the physics tilt so the lean reads clearly on screen. */
 const VISUAL_TILT_GAIN = 1.6
-const WALL_HEIGHT = 0.55
+const WALL_HEIGHT = 0.42
 const WALL_INSET = 1
-const FRAME_HEIGHT = 0.7
+const FRAME_HEIGHT = 0.46
 /** How far the frame's outer edge sits beyond the grid's edge. Negative: a rim thinner than the border cells. */
 const FRAME_EXTEND = -0.4
 const FLOOR_DEPTH = 0.18
-const WELL_DEPTH = 0.9
+/** How far the floor slab reaches in under the frame. */
+const FLOOR_TUCK = 0.05
+const WELL_DEPTH = 0.6
 const BASE_MARGIN = 0.05
-const BASE_THICKNESS = 0.35
+const BASE_THICKNESS = 0.3
+/** How far the plinth sticks out past the box on every side. */
+const BASE_LIP = 0.12
 const BEVEL_RING_WIDTH = 0.05
 /** ExtrudeGeometry UVs are in shape units (one per cell), so this tiles the grain every 6 cells. */
 const WOOD_REPEAT = 1 / 6
@@ -46,17 +50,21 @@ const GOAL_PARTICLE_COUNT = 60
 const GOAL_PARTICLE_LIFE = 1.2
 const GOAL_PARTICLE_GRAVITY = 1.8
 
-const CAMERA_FOV = 38
-const CAMERA_ELEVATION_DEG = 68
-const CAMERA_MARGIN = 0.1
+/** The isometric view: a parallel projection looking along the board's diagonal from above. */
+const CAMERA_AZIMUTH_DEG = 45
+const CAMERA_ELEVATION_DEG = 45
+/** How far out the camera sits. A parallel projection looks the same from any distance; this only has to clear the board. */
+const CAMERA_ORBIT_DISTANCE = 80
+const CAMERA_FAR = 400
+const CAMERA_MARGIN = 0.06
 const DEMO_SWAY_DEG = 12
 const DEMO_SWAY_PERIOD = 9
 const AZIMUTH_EASE_RATE = 2
 const MAX_FRAME_DT = 0.1
 /** The fit never treats less than this fraction of the viewport as free, however large the insets. */
 const MIN_FREE_FRACTION = 0.3
-const FIT_MIN_DISTANCE = 1
-const FIT_MAX_DISTANCE = 400
+const FIT_MIN_HALF_HEIGHT = 0.5
+const FIT_MAX_HALF_HEIGHT = 200
 const FIT_ITERATIONS = 24
 
 /** Board-local x for a physics point: physics x maps straight across, centred on the grid. */
@@ -88,9 +96,11 @@ interface Disposable {
 function buildFloor(level: Level, texture: THREE.Texture): { mesh: THREE.Mesh } & Disposable {
   const { cols, rows } = level
   const shape = new THREE.Shape()
-  // The floor stops where the frame's outer edge does, so it never pokes out from under the rim.
-  const [x0, y0] = shapePoint({ x: -FRAME_EXTEND, y: -FRAME_EXTEND }, cols, rows)
-  const [x1, y1] = shapePoint({ x: cols + FRAME_EXTEND, y: rows + FRAME_EXTEND }, cols, rows)
+  // The floor tucks just inside the frame, whose sides run down past it, so the floor's own edge
+  // never shows from the low isometric camera.
+  const inner = 1 - FLOOR_TUCK
+  const [x0, y0] = shapePoint({ x: inner, y: inner }, cols, rows)
+  const [x1, y1] = shapePoint({ x: cols - inner, y: rows - inner }, cols, rows)
   shape.moveTo(x0, y0)
   shape.lineTo(x1, y0)
   shape.lineTo(x1, y1)
@@ -158,7 +168,8 @@ function buildWalls(level: Level, texture: THREE.Texture): { group: THREE.Group 
   }
 
   // Outer frame: a taller rim whose inner face is the border cells' inner edge (where the marble
-  // actually bounces), built from four boxes sharing one unit geometry (scaled per side).
+  // actually bounces), built from four boxes sharing one unit geometry (scaled per side). Its sides
+  // run down to the plinth, so from the isometric camera the board reads as one solid wooden box.
   const frameGeometry = new THREE.BoxGeometry(1, 1, 1)
   const frameMaterial = new THREE.MeshStandardMaterial({ map: texture, color: FRAME_TINT, roughness: 0.7, metalness: 0.05 })
   const outerW = cols / 2 + FRAME_EXTEND
@@ -171,10 +182,11 @@ function buildWalls(level: Level, texture: THREE.Texture): { group: THREE.Group 
     { x: -(outerW + innerW) / 2, z: 0, w: outerW - innerW, d: 2 * innerH },
     { x: (outerW + innerW) / 2, z: 0, w: outerW - innerW, d: 2 * innerH },
   ]
+  const boxDepth = WELL_DEPTH + BASE_MARGIN
   for (const bar of bars) {
     const mesh = new THREE.Mesh(frameGeometry, frameMaterial)
-    mesh.scale.set(bar.w, FRAME_HEIGHT, bar.d)
-    mesh.position.set(bar.x, FRAME_HEIGHT / 2, bar.z)
+    mesh.scale.set(bar.w, FRAME_HEIGHT + boxDepth, bar.d)
+    mesh.position.set(bar.x, (FRAME_HEIGHT - boxDepth) / 2, bar.z)
     mesh.castShadow = true
     mesh.receiveShadow = true
     group.add(mesh)
@@ -182,10 +194,10 @@ function buildWalls(level: Level, texture: THREE.Texture): { group: THREE.Group 
 
   // A plinth beneath the whole board. It sits below the deepest well so it never blocks the
   // view down into a hole (the well's own bottom disc is what the player actually sees).
-  const baseGeometry = new THREE.BoxGeometry(2 * outerW, BASE_THICKNESS, 2 * outerH)
+  const baseGeometry = new THREE.BoxGeometry(2 * (outerW + BASE_LIP), BASE_THICKNESS, 2 * (outerH + BASE_LIP))
   const baseMaterial = new THREE.MeshStandardMaterial({ color: BASE_COLOR, roughness: 0.9 })
   const base = new THREE.Mesh(baseGeometry, baseMaterial)
-  const baseTopY = -(WELL_DEPTH + BASE_MARGIN)
+  const baseTopY = -boxDepth
   base.position.set(0, baseTopY - BASE_THICKNESS / 2, 0)
   base.receiveShadow = true
   group.add(base)
@@ -392,12 +404,21 @@ function updateParticleBurst(burst: ParticleBurst, dt: number): void {
 
 /** Smoothstep easing for the sink/pop animations. */
 /** Puts a camera on the orbit around the board centre, looking at it. */
-function placeCamera(target: THREE.PerspectiveCamera, distance: number, azimuth: number): void {
+function placeCamera(target: THREE.Camera, azimuth: number): void {
   const elevation = THREE.MathUtils.degToRad(CAMERA_ELEVATION_DEG)
-  const horizontal = distance * Math.cos(elevation)
-  const height = distance * Math.sin(elevation)
+  const horizontal = CAMERA_ORBIT_DISTANCE * Math.cos(elevation)
+  const height = CAMERA_ORBIT_DISTANCE * Math.sin(elevation)
   target.position.set(horizontal * Math.sin(azimuth), height, horizontal * Math.cos(azimuth))
   target.lookAt(0, 0, 0)
+}
+
+/** Sizes a parallel-projection frustum: `halfHeight` world units from the centre to the top edge. */
+function setFrustum(target: THREE.OrthographicCamera, halfHeight: number, aspect: number): void {
+  target.left = -halfHeight * aspect
+  target.right = halfHeight * aspect
+  target.top = halfHeight
+  target.bottom = -halfHeight
+  target.updateProjectionMatrix()
 }
 
 function easeInOut(t: number): number {
@@ -472,9 +493,10 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
   wallTexture.anisotropy = renderer.capabilities.getMaxAnisotropy()
 
   // --- Camera --------------------------------------------------------------------------------------
-  const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 200)
-  let cameraDistance = 10
-  let azimuth = 0
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, CAMERA_FAR)
+  let aspect = 1
+  const baseAzimuth = THREE.MathUtils.degToRad(CAMERA_AZIMUTH_DEG)
+  let azimuth = baseAzimuth
   let insets: ViewInsets = { left: 0, top: 0, right: 0, bottom: 0 }
   let demoSwayT = 0
 
@@ -492,7 +514,7 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
   boardGroup.add(particleBurst.points)
 
   // --- Input / autopilot -----------------------------------------------------------------------------
-  const input = createTiltInput(canvas)
+  const input = createTiltInput(canvas, { viewAzimuth: baseAzimuth })
 
   // --- Mutable per-run state -------------------------------------------------------------------------
   interface BoardParts extends Disposable {
@@ -712,10 +734,11 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     boardGroup.rotation.x = tilt.y * VISUAL_TILT_GAIN
     boardGroup.rotation.z = -tilt.x * VISUAL_TILT_GAIN
 
-    const targetAzimuth =
+    const sway =
       mode === 'demo'
         ? THREE.MathUtils.degToRad(DEMO_SWAY_DEG) * Math.sin((demoSwayT / DEMO_SWAY_PERIOD) * Math.PI * 2)
         : 0
+    const targetAzimuth = baseAzimuth + sway
     if (mode === 'demo') demoSwayT += dt
     azimuth += (targetAzimuth - azimuth) * (1 - Math.exp(-AZIMUTH_EASE_RATE * dt))
     positionCamera()
@@ -731,15 +754,15 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     }
   }
 
-  /** Places the camera on its (eased) azimuth, at the distance `fitCamera` last computed. */
+  /** Places the camera on its (eased) azimuth. */
   function positionCamera(): void {
-    placeCamera(camera, cameraDistance, azimuth)
+    placeCamera(camera, azimuth)
   }
 
   /**
-   * Recomputes the camera distance so the framed board fits the part of the viewport the UI leaves
+   * Recomputes the size of the view so the framed board fits the part of the viewport the UI leaves
    * free, and shifts the view so the board is centred in that part. The fit projects the frame's
-   * corners through a probe camera, so perspective (the near edge looms larger) is accounted for.
+   * corners through a probe camera at every azimuth the camera can reach.
    */
   function fitCamera(level: Level): void {
     const viewWidth = canvas.clientWidth
@@ -761,12 +784,13 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     }
 
     const sway = THREE.MathUtils.degToRad(DEMO_SWAY_DEG)
-    const azimuths = mode === 'demo' ? [-sway, 0, sway] : [0]
-    const probe = new THREE.PerspectiveCamera(CAMERA_FOV, camera.aspect, camera.near, camera.far)
+    const azimuths = mode === 'demo' ? [baseAzimuth - sway, baseAzimuth, baseAzimuth + sway] : [baseAzimuth]
+    const probe = new THREE.OrthographicCamera(-1, 1, 1, -1, camera.near, camera.far)
     const projected = new THREE.Vector3()
-    const fits = (distance: number): boolean =>
+    const fits = (halfHeight: number): boolean =>
       azimuths.every((probeAzimuth) => {
-        placeCamera(probe, distance, probeAzimuth)
+        setFrustum(probe, halfHeight, aspect)
+        placeCamera(probe, probeAzimuth)
         probe.updateMatrixWorld()
         return corners.every((corner) => {
           projected.copy(corner).project(probe)
@@ -774,14 +798,14 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
         })
       })
 
-    let near = FIT_MIN_DISTANCE
-    let far = FIT_MAX_DISTANCE
+    let tooSmall = FIT_MIN_HALF_HEIGHT
+    let bigEnough = FIT_MAX_HALF_HEIGHT
     for (let i = 0; i < FIT_ITERATIONS; i++) {
-      const middle = (near + far) / 2
-      if (fits(middle)) far = middle
-      else near = middle
+      const middle = (tooSmall + bigEnough) / 2
+      if (fits(middle)) bigEnough = middle
+      else tooSmall = middle
     }
-    cameraDistance = far
+    setFrustum(camera, bigEnough, aspect)
 
     camera.setViewOffset(
       viewWidth,
@@ -813,8 +837,7 @@ export function createEngine(canvas: HTMLCanvasElement, events: EngineEvents): E
     const height = canvas.clientHeight
     if (width === 0 || height === 0) return
     renderer.setSize(width, height, false)
-    camera.aspect = width / height
-    camera.updateProjectionMatrix()
+    aspect = width / height
     if (currentLevel) fitCamera(currentLevel)
   }
 
