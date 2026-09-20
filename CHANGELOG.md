@@ -2,6 +2,12 @@
 
 All notable changes to Marble Tilt are documented in this file, following the [Keep a Changelog](https://keepachangelog.com/) format.
 
+## [1.3.1] - 2026-09-20
+
+### Changed
+
+- The mouse now steers exactly like a finger on a phone: click anywhere and nothing happens until you drag, then the board tilts the way you drag, steeper the farther you go, and levels when you let go. Before, pressing the button tilted the board toward the cursor at once, so a click away from the centre threw the board into a steep tilt.
+
 ## [1.3.0] - 2026-09-20
 
 ### Changed

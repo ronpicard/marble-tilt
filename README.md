@@ -4,7 +4,7 @@ Marble Tilt is a 3D wooden labyrinth that runs in the browser. Tilt the board wi
 
 ## How to play
 
-- Mouse: hold the left button and the board tilts toward the cursor; the farther the cursor is from the centre of the window, the steeper. Let go and the board returns to flat. Just moving the mouse does nothing, so the board never tilts by accident.
+- Mouse: click and drag, exactly like a finger on a phone. Pressing the button does nothing by itself; drag away from the spot where you pressed and the board tilts that way, steeper the farther you drag. Let go and the board returns to flat. You can start the drag anywhere in the window.
 - Keyboard: arrow keys or WASD tilt the board in steps, and the board stays where you leave it, like a hand resting on a real labyrinth. A tap adds a quarter of the full tilt, holding a key keeps tilting until it reaches the maximum, the opposite key steps back, and Space levels the board. The keys work along the board's own rows and columns, which run diagonally across the isometric view: Up is up-right, Right is down-right, Down is down-left, and Left is up-left. Two keys together tilt between them. The board levels itself whenever the marble is put back at the start.
 - Touch: drag anywhere on the board like a virtual joystick — the farther from where you first touched, the steeper the tilt. Release to flatten.
 - Phone tilt: turn on "Tilt with your phone" from the menu, then tilt your device itself. iOS asks for a one-time motion-access permission the first time you tap the toggle; allow it to steer by tilt. A recentre button appears during play to make your phone's current pose the new "flat," in case you weren't holding it level when you turned tilt on.
@@ -44,7 +44,7 @@ The marble is a circle rolling on a board with two levels, the floor and a raise
 
 All of this runs at a fixed step of `FIXED_DT`, decoupled from the render frame rate, so the simulation behaves identically regardless of how fast or slow the browser is actually drawing frames.
 
-Every input source feeds into the same tilt value before physics ever sees it, just scaled differently: a held mouse button or a touch drag reaches the board's maximum tilt over a proportional pixel distance, the keys add to a tilt that stays put until it reaches that same maximum, and a phone's rotation reaches it once you've turned the device a fixed number of degrees from wherever you recentred it. Whichever way you're steering, the board responds the same way underneath.
+Every input source feeds into the same tilt value before physics ever sees it, just scaled differently: a mouse or touch drag reaches the board's maximum tilt over a fixed pixel distance from where the drag started, the keys add to a tilt that stays put until it reaches that same maximum, and a phone's rotation reaches it once you've turned the device a fixed number of degrees from wherever you recentred it. Whichever way you're steering, the board responds the same way underneath.
 
 ## Every level is proven finishable
 

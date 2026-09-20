@@ -115,7 +115,7 @@ export default function Menu({
   const maxStars = levels.length * MAX_STARS_PER_LEVEL
   const howTo = coarsePointer
     ? 'Drag anywhere to tilt — or turn on motion and tilt your phone.'
-    : 'Hold the mouse button to tilt the board toward the cursor, or tap the arrow keys.'
+    : 'Click and drag to tilt the board the way you drag, or tap the arrow keys.'
 
   return (
     <div className="menu-screen">
